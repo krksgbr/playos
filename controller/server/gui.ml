@@ -40,6 +40,19 @@ let load_partial name =
    in
    Some partial
 
+let load_mustache_files dir =
+  let resource_dir = resource_path dir in
+  resource_dir
+  |> Sys.readdir
+  |> Array.to_list
+  |> List.filter (fun x -> Filename.extension x = ".mustache")
+  |> List.map (fun file -> (Filename.chop_extension file, Fpath.(v resource_dir / file)))
+  |> Lwt_list.map_p (fun (file, path) ->
+     let%lwt contents = Util.read_from_file log_src (Fpath.to_string path) in
+     return (file, Mustache.of_string contents)
+   )
+
+
 (* Helper to render template *)
 let render name dict =
   let%lwt template = template name in
@@ -260,7 +273,7 @@ module NetworkGui = struct
     let blur p = Proxy.validate p |> Option.map (Proxy.to_string ~hide_password:true) in
     { s with proxy = s.proxy |> Base.Fn.flip Option.bind blur }
 
-  let overview ~(connman:Manager.t) req =
+  let overview ~render_page ~(connman:Manager.t) req =
 
     let%lwt all_services = Manager.get_services connman in
 
@@ -290,10 +303,10 @@ module NetworkGui = struct
     (* If not connected show all services, otherwise show services that are connected *)
     let showed_services =
       all_services
-        |> List.filter (fun s -> not is_internet_connected || Service.is_connected s)
+        (* |> List.filter (fun s -> not is_internet_connected || Service.is_connected s) *)
     in
 
-    page "network"
+    render_page "network"
       [
         "internet_connected", is_internet_connected |> Ezjsonm.bool
       ; "has_proxy", Option.is_some proxy |> Ezjsonm.bool
@@ -387,9 +400,9 @@ module NetworkGui = struct
     let%lwt () = Connman.Service.remove service in
     success (Format.sprintf "Removed service %s." service.name)
 
-  let build ~(connman:Connman.Manager.t) app =
+  let build ~render_page ~(connman:Connman.Manager.t) app =
     app
-    |> get "/network" (overview ~connman)
+    |> get "/network" (overview ~render_page ~connman)
     |> get "/network/:id" (details ~connman)
     |> post "/network/:id/connect" (connect ~connman)
     |> post "/network/:id/proxy/update" (update_proxy ~connman)
@@ -496,16 +509,16 @@ module StatusGui = struct
 end
 
 module ChangelogGui = struct
-  let build app =
+  let build render_page app =
     app
     |> get "/changelog" (fun _ ->
         let%lwt changelog = Util.read_from_file log_src (resource_path (Fpath.v "Changelog.html")) in
-        page "changelog" [
+        render_page "changelog" [
           "changelog", changelog |> Ezjsonm.string
         ])
 end
 
-let routes ~shutdown ~health_s ~update_s ~rauc ~connman app =
+let routes ~shutdown ~health_s ~update_s ~rauc ~connman ~render_page app =
   app
   |> middleware (static ())
   |> middleware error_handling
@@ -519,15 +532,34 @@ let routes ~shutdown ~health_s ~update_s ~rauc ~connman app =
     )
 
   |> InfoGui.build
-  |> NetworkGui.build ~connman
+  |> NetworkGui.build ~render_page ~connman
   |> LocalizationGui.build
   |> LabelGui.build
   |> StatusGui.build ~health_s ~update_s ~rauc
-  |> ChangelogGui.build
+  |> ChangelogGui.build render_page
 
 (* NOTE: probably easier to create a record with all the inputs instead of passing in x arguments. *)
 let start ~port ~shutdown ~health_s ~update_s ~rauc ~connman =
+  let%lwt templates = load_mustache_files (Fpath.(v "template")) in
+  let%lwt partials = load_mustache_files (Fpath.(v "template" / "partials")) in
+  let get_partial name =
+     List.assoc_opt name partials in
+  (* Helper to render template *)
+  let render_template name dict =
+    let template = List.assoc name templates in
+    Mustache.render ~strict:false ~partials:get_partial template (Ezjsonm.dict dict)
+    |> return
+  in
+  let render_page identifier page_values =
+    let menu_flag = ( "is_" ^ identifier, Ezjsonm.bool true ) in
+    let index_with_menu_flag content =
+      render_template "index" (menu_flag :: ["content", content |> Ezjsonm.string])
+    in
+    render_template identifier page_values
+    >>= index_with_menu_flag
+    >|= Response.of_string_body
+  in
   empty
   |> Opium.App.port port
-  |> routes ~shutdown ~health_s ~update_s ~rauc ~connman
+  |> routes ~shutdown ~health_s ~update_s ~rauc ~connman ~render_page
   |> start
